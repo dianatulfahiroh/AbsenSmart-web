@@ -1,0 +1,13 @@
+# Database
+*.sql
+*.sql.gz
+*.bak
+
+# Konfigurasi rahasia
+config.php
+.env
+
+# File sistem
+.DS_Store
+Thumbs.db
+test_connection.php
