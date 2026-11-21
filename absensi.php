@@ -1322,9 +1322,13 @@ thead th {
                                                     name="status[<?= (int)$siswa['id_siswa'] ?>]">
 
                                                     <?php
-                                                    $selectedStatus =
-                                                        $existing['status'] ?? 'Hadir';
+                                                   $selectedStatus =
+    $existing['status'] ?? '';
                                                     ?>
+
+                                                    <option value="" disabled <?= $selectedStatus === '' ? 'selected' : '' ?>>
+    Pilih Status
+</option>
 
                                                     <?php foreach ($statusValid as $st): ?>
 

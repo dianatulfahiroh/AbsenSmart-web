@@ -1,5 +1,6 @@
-
 <?php
+// Buffer output agar file Excel tidak tercampur output dari PHP/config.
+ob_start();
 session_start();
 require_once __DIR__ . '/config.php';
 
@@ -26,6 +27,91 @@ $isAdmin = $role === 'admin';
 
 if (empty($_SESSION['csrf_siswa'])) {
     $_SESSION['csrf_siswa'] = bin2hex(random_bytes(32));
+}
+
+/*
+ * Fitur Import Excel menggunakan PhpSpreadsheet.
+ * Instal sekali dari folder proyek AbsenSmart:
+ * composer require phpoffice/phpspreadsheet
+ */
+function loadSpreadsheetLibrary(): void {
+    $autoload = __DIR__ . '/vendor/autoload.php';
+    if (!file_exists($autoload)) {
+        throw new RuntimeException(
+            'Library Excel belum terpasang. Jalankan: composer require phpoffice/phpspreadsheet'
+        );
+    }
+    require_once $autoload;
+}
+
+// Download template Excel
+if (isset($_GET['download_template'])) {
+    try {
+        loadSpreadsheetLibrary();
+
+        $spreadsheet = new \PhpOffice\PhpSpreadsheet\Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('Data Siswa');
+        $headers = [
+            'NISN',
+            'Nama Lengkap',
+            'Jenis Kelamin',
+            'Kelas',
+            'Jurusan',
+            'Nomor Telepon Wali',
+            'Alamat'
+        ];
+        $sheet->fromArray($headers, null, 'A1');
+
+        $sheet->getStyle('A1:G1')->getFont()->setBold(true);
+        $sheet->getStyle('A1:G1')->getFill()
+            ->setFillType(\PhpOffice\PhpSpreadsheet\Style\Fill::FILL_SOLID)
+            ->getStartColor()->setARGB('FFFFCED8');
+
+        foreach (range('A', 'G') as $column) {
+            $sheet->getColumnDimension($column)->setAutoSize(true);
+        }
+
+        $sheet->setCellValue('A2', '');
+        $sheet->setCellValue('B2', '');
+        $sheet->setCellValue('C2', '');
+        $sheet->setCellValue('D2', '');
+        $sheet->setCellValue('E2', '');
+        $sheet->setCellValue('F2', '');
+        $sheet->setCellValue('G2', '');
+
+        $sheet->getStyle('A2:A1000')->getNumberFormat()
+            ->setFormatCode(\PhpOffice\PhpSpreadsheet\Style\NumberFormat::FORMAT_TEXT);
+        $sheet->getStyle('F2:F1000')->getNumberFormat()
+            ->setFormatCode(\PhpOffice\PhpSpreadsheet\Style\NumberFormat::FORMAT_TEXT);
+
+        // Bersihkan seluruh buffer sebelum mengirim file XLSX.
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
+        if (headers_sent($file, $line)) {
+            throw new RuntimeException('Header sudah terkirim dari ' . $file . ' baris ' . $line . '. Periksa config.php agar tidak menghasilkan output.');
+        }
+
+        header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        header('Content-Disposition: attachment; filename="template_import_siswa.xlsx"');
+        header('Content-Transfer-Encoding: binary');
+        header('Cache-Control: max-age=0, no-store, no-cache, must-revalidate');
+        header('Pragma: public');
+        header('X-Content-Type-Options: nosniff');
+
+        $writer = new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($spreadsheet);
+        $writer->save('php://output');
+        exit;
+    } catch (Throwable $ex) {
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=UTF-8');
+        exit($ex->getMessage());
+    }
 }
 
 $pesan = '';
@@ -65,6 +151,149 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         $aksi = $_POST['aksi'] ?? '';
+
+        // IMPORT DATA SISWA DARI FILE EXCEL
+        if ($aksi === 'import_excel') {
+            loadSpreadsheetLibrary();
+
+            if (
+                !isset($_FILES['file_excel']) ||
+                $_FILES['file_excel']['error'] !== UPLOAD_ERR_OK
+            ) {
+                throw new RuntimeException('Pilih file Excel terlebih dahulu.');
+            }
+
+            $namaFile = $_FILES['file_excel']['name'] ?? '';
+            $ekstensi = strtolower(pathinfo($namaFile, PATHINFO_EXTENSION));
+            if (!in_array($ekstensi, ['xlsx', 'xls'], true)) {
+                throw new RuntimeException('Format file harus .xlsx atau .xls.');
+            }
+
+            if ($_FILES['file_excel']['size'] > 10 * 1024 * 1024) {
+                throw new RuntimeException('Ukuran file maksimal 10 MB.');
+            }
+
+            $spreadsheet = \PhpOffice\PhpSpreadsheet\IOFactory::load(
+                $_FILES['file_excel']['tmp_name']
+            );
+            $rows = $spreadsheet->getActiveSheet()->toArray(null, true, true, false);
+
+            if (count($rows) < 2) {
+                throw new RuntimeException('File Excel belum berisi data siswa.');
+            }
+
+            $headerWajib = [
+                'NISN', 'Nama Lengkap', 'Jenis Kelamin', 'Kelas',
+                'Jurusan', 'Nomor Telepon Wali', 'Alamat'
+            ];
+            $headerAktual = array_map(
+                static fn($v) => strtolower(trim((string)$v)),
+                array_slice($rows[0], 0, 7)
+            );
+            $headerPembanding = array_map('strtolower', $headerWajib);
+
+            if ($headerAktual !== $headerPembanding) {
+                throw new RuntimeException(
+                    'Susunan kolom tidak sesuai. Gunakan file Download Template Excel dari halaman ini.'
+                );
+            }
+
+            $berhasil = 0;
+            $gagal = [];
+            $nisnDalamFile = [];
+
+            $cekNisn = $pdo->prepare(
+                'SELECT id_siswa FROM siswa WHERE nisn = :nisn LIMIT 1'
+            );
+            $insertSiswa = $pdo->prepare("
+                INSERT INTO siswa (
+                    nisn, nama_siswa, jenis_kelamin, kelas,
+                    jurusan, alamat, no_telepon_wali
+                ) VALUES (
+                    :nisn, :nama, :jk, :kelas,
+                    :jurusan, :alamat, :telepon
+                )
+            ");
+
+            foreach (array_slice($rows, 1, null, true) as $index => $row) {
+                $nomorBaris = $index + 1;
+                $row = array_pad($row, 7, null);
+
+                $nisn = trim((string)($row[0] ?? ''));
+                $nama = trim((string)($row[1] ?? ''));
+                $jkInput = strtolower(trim((string)($row[2] ?? '')));
+                $kelas = strtoupper(trim((string)($row[3] ?? '')));
+                $jurusan = strtoupper(trim((string)($row[4] ?? '')));
+                $telepon = trim((string)($row[5] ?? ''));
+                $alamat = trim((string)($row[6] ?? ''));
+
+                if ($nisn === '' && $nama === '' && $jkInput === '' &&
+                    $kelas === '' && $jurusan === '' && $telepon === '' && $alamat === '') {
+                    continue;
+                }
+
+                try {
+                    if ($nama === '') {
+                        throw new RuntimeException('Nama siswa wajib diisi.');
+                    }
+                    if (strlen($nama) > 120) {
+                        throw new RuntimeException('Nama maksimal 120 karakter.');
+                    }
+
+                    if (in_array($jkInput, ['l', 'laki-laki', 'laki laki'], true)) {
+                        $jk = 'Laki-laki';
+                    } elseif (in_array($jkInput, ['p', 'perempuan'], true)) {
+                        $jk = 'Perempuan';
+                    } else {
+                        throw new RuntimeException('Jenis kelamin harus Laki-laki atau Perempuan.');
+                    }
+
+                    if (!in_array($kelas, $kelasPilihan, true)) {
+                        throw new RuntimeException('Kelas tidak sesuai pilihan AbsenSmart.');
+                    }
+                    if (!in_array($jurusan, $jurusanPilihan, true)) {
+                        throw new RuntimeException('Jurusan tidak sesuai pilihan AbsenSmart.');
+                    }
+                    if ($nisn !== '' && !preg_match('/^[0-9]{1,20}$/', $nisn)) {
+                        throw new RuntimeException('NISN harus berupa angka maksimal 20 digit.');
+                    }
+                    if ($telepon !== '' && strlen($telepon) > 20) {
+                        throw new RuntimeException('Nomor telepon wali maksimal 20 karakter.');
+                    }
+
+                    if ($nisn !== null && $nisn !== '') {
+                        if (isset($nisnDalamFile[$nisn])) {
+                            throw new RuntimeException('NISN duplikat di dalam file Excel.');
+                        }
+                        $cekNisn->execute(['nisn' => $nisn]);
+                        if ($cekNisn->fetchColumn()) {
+                            throw new RuntimeException('NISN sudah terdaftar di database.');
+                        }
+                        $nisnDalamFile[$nisn] = true;
+                    }
+
+                    $insertSiswa->execute([
+                        'nisn' => $nisn === '' ? null : $nisn,
+                        'nama' => $nama,
+                        'jk' => $jk,
+                        'kelas' => $kelas,
+                        'jurusan' => $jurusan,
+                        'alamat' => $alamat === '' ? null : $alamat,
+                        'telepon' => $telepon === '' ? null : $telepon
+                    ]);
+                    $berhasil++;
+                } catch (Throwable $rowError) {
+                    $gagal[] = 'Baris ' . $nomorBaris . ': ' . $rowError->getMessage();
+                }
+            }
+
+            $_SESSION['hasil_import_siswa'] = [
+                'berhasil' => $berhasil,
+                'gagal' => $gagal
+            ];
+            header('Location: data_siswa.php?pesan=import');
+            exit;
+        }
 
         // TAMBAH DAN EDIT SISWA
         if ($aksi === 'simpan') {
@@ -203,6 +432,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'tambah' => 'Data siswa berhasil ditambahkan.',
             'edit' => 'Data siswa berhasil diperbarui.',
             'hapus' => 'Data siswa berhasil dihapus.',
+            'import' => 'Proses import Excel selesai.',
             default => ''
         };
     }
@@ -453,6 +683,63 @@ body {
     margin-top: 8px;
 }
 
+.student-entry-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(340px, .9fr);
+    gap: 20px;
+    align-items: start;
+    margin-bottom: 22px;
+}
+
+.student-entry-grid > .panel {
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+.import-description {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+    margin: -7px 0 18px;
+}
+
+.import-step {
+    border-top: 1px solid var(--line);
+    padding: 15px 0;
+}
+
+.import-step:first-of-type {
+    border-top: 0;
+}
+
+.import-step strong {
+    display: block;
+    font-size: 14px;
+    margin-bottom: 5px;
+}
+
+.import-step p {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+    margin: 0 0 10px;
+}
+
+.import-note {
+    background: #fff8e6;
+    border: 1px solid #f4df9b;
+    border-radius: 10px;
+    padding: 12px;
+    color: #72551b;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.import-file {
+    font-size: 12px;
+    padding: 9px;
+}
+
 .form-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
@@ -603,6 +890,12 @@ th {
     margin-top: 18px;
 }
 
+@media(max-width: 1000px) {
+    .student-entry-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
 @media(max-width: 850px) {
     .sidebar {
         width: 190px;
@@ -712,6 +1005,7 @@ th {
 
 <?php if ($isAdmin || $role === 'guru'): ?>
 
+<div class="student-entry-grid">
 <section class="panel">
 
     <h2 class="section-title">
@@ -829,6 +1123,85 @@ th {
     </form>
 
 </section>
+
+<section class="panel">
+    <h2 class="section-title">Import Excel</h2>
+    <p class="import-description">
+        Tambahkan data siswa dengan mengunggah file Excel yang sudah berisi daftar siswa.
+    </p>
+
+    <div class="import-step">
+        <strong>1. Download Template</strong>
+        <p>Unduh template Excel agar susunan kolom sesuai dengan database AbsenSmart.</p>
+        
+        <a href="data_siswa.php?download_template=1" class="btn secondary">
+    <svg xmlns="http://www.w3.org/2000/svg"
+         width="18"
+         height="18"
+         viewBox="0 0 24 24"
+         fill="none"
+         stroke="currentColor"
+         stroke-width="2"
+         stroke-linecap="round"
+         stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+    </svg>
+    Download Template Excel
+</a>
+
+    </div>
+
+    <div class="import-step">
+        <strong>2. Upload File Excel</strong>
+        <p>Pilih file Excel (.xlsx atau .xls) yang sudah diisi.</p>
+        <form method="post" action="data_siswa.php" enctype="multipart/form-data">
+            <input type="hidden" name="aksi" value="import_excel">
+            <input type="hidden" name="csrf_token" value="<?= e($_SESSION['csrf_siswa']) ?>">
+            <input
+                class="import-file"
+                type="file"
+                name="file_excel"
+                accept=".xlsx,.xls"
+                required
+            >
+            <div style="margin-top:12px">
+                <button type="submit" class="btn">Import Excel</button>
+            </div>
+        </form>
+    </div>
+
+    <div class="import-note">
+        <strong>Format Template Excel</strong><br>
+        Kolom: NISN, Nama Lengkap, Jenis Kelamin, Kelas, Jurusan,
+        Nomor Telepon Wali, dan Alamat.<br>
+        NISN, nomor telepon wali, dan alamat boleh dikosongkan.
+        Gunakan Laki-laki/Perempuan atau L/P untuk jenis kelamin.
+    </div>
+
+    <?php if (!empty($_SESSION['hasil_import_siswa'])): ?>
+        <?php $hasilImport = $_SESSION['hasil_import_siswa']; unset($_SESSION['hasil_import_siswa']); ?>
+        <div class="notice" style="margin-top:14px">
+            Berhasil diimpor: <strong><?= (int)$hasilImport['berhasil'] ?></strong> siswa.
+            <br>Data dilewati: <strong><?= count($hasilImport['gagal']) ?></strong> baris.
+        </div>
+        <?php if (!empty($hasilImport['gagal'])): ?>
+            <div class="notice error">
+                <strong>Rincian data yang tidak diimpor:</strong>
+                <ul style="padding-left:18px;margin-bottom:0">
+                    <?php foreach (array_slice($hasilImport['gagal'], 0, 15) as $detailGagal): ?>
+                        <li><?= e($detailGagal) ?></li>
+                    <?php endforeach; ?>
+                </ul>
+                <?php if (count($hasilImport['gagal']) > 15): ?>
+                    <p>Dan <?= count($hasilImport['gagal']) - 15 ?> baris lainnya.</p>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
+    <?php endif; ?>
+</section>
+</div>
 
 <?php endif; ?>
 
